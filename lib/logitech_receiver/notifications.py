@@ -35,6 +35,7 @@ from . import hidpp10
 from . import settings
 from . import hidpp10_constants
 from . import hidpp20
+from . import settings
 from . import settings_templates
 from .common import Alert
 from .common import BatteryStatus

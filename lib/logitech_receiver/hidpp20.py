@@ -2039,9 +2039,13 @@ class Hidpp20:
     def set_configuration_complete(self, device: Device, cookie=None, no_reply=False):
         """ConfigChange (0x0020) SetComplete — acknowledge host has synced with device configuration.
 
-        If cookie is None, reads the current cookie from the device first."""
+        If cookie is None, reads the current cookie and increments it to mark
+        a new sync point, so future cookie changes indicate device-side drift."""
         if cookie is None:
             cookie = self.get_configuration_cookie(device)
+            if cookie and len(cookie) >= 2:
+                value = (cookie[0] << 8 | cookie[1]) + 1 & 0xFFFF
+                cookie = bytes([value >> 8, value & 0xFF])
         if cookie and len(cookie) >= 2:
             return device.feature_request(SupportedFeature.CONFIG_CHANGE, 0x10, cookie[0], cookie[1], no_reply=no_reply)
 
