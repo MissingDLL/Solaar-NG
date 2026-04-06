@@ -528,14 +528,15 @@ class Device:
             self.online = active
             was_active, self._active = self._active, active
             if active:
-                # Push settings for new devices when devices request software reconfiguration
-                # and when devices become active if they don't have wireless device status feature,
-                if (
+                # Push settings for new devices, when devices request software reconfiguration,
+                # and when devices become active if they don't have wireless device status feature.
+                needs_push = (
                     was_active is None
                     or not was_active
                     or push
-                    and (not self.features or SupportedFeature.WIRELESS_DEVICE_STATUS not in self.features)
-                ):
+                    or (not self.features or SupportedFeature.WIRELESS_DEVICE_STATUS not in self.features)
+                )
+                if needs_push:
                     if logger.isEnabledFor(logging.INFO):
                         logger.info("%s pushing device settings %s", self, self.settings)
                     settings.apply_all_settings(self)
