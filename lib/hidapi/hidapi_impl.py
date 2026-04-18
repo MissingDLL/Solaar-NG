@@ -433,6 +433,24 @@ def open_path(device_path: str) -> int:
     return device_handle
 
 
+def read_feature_report(device_handle, report_id: int, size: int = 64) -> bytes | None:
+    """Read a Feature report from a HID device.
+
+    :param device_handle: a device handle returned by open() or open_path().
+    :param report_id: the HID report ID to request.
+    :param size: total buffer size including the report ID byte.
+
+    :returns: the raw report bytes, or None on error.
+    """
+    assert device_handle
+    buf = ctypes.create_string_buffer(size)
+    buf[0] = report_id
+    result = _hidapi.hid_get_feature_report(device_handle, buf, size)
+    if result < 0:
+        return None
+    return bytes(buf[:result]) if result > 0 else None
+
+
 def close(device_handle) -> None:
     """Close a HID device.
 

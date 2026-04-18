@@ -80,7 +80,19 @@ def create_device(low_level: LowLevelInterface, device_info, setting_callback=No
         if handle:
             if getattr(device_info, "centurion", False):
                 report_id = getattr(device_info, "centurion_report_id", None) or base.CENTURION_REPORT_ID
-                base._centurion_handles[int(handle)] = base.CenturionHandleState(report_id=report_id)
+                state = base.CenturionHandleState(report_id=report_id)
+                # Prefer device_addr learned during create_centurion_receiver() probe,
+                # fall back to static table, so battery queries use the correct address
+                # from the very first poll instead of defaulting to 0x00 (no response).
+                known_addr = base._centurion_known_device_addrs.pop(device_info.path, None)
+                if known_addr is not None:
+                    state.device_addr = known_addr
+                elif report_id == base.CENTURION_ADDRESSED_REPORT_ID:
+                    pid = getattr(device_info, "product_id", None)
+                    static_addr = base._CENTURION_STATIC_DEVICE_ADDRS.get(pid) if pid is not None else None
+                    if static_addr is not None:
+                        state.device_addr = static_addr
+                base._centurion_handles[int(handle)] = state
             # a direct connected device might not be online (as reported by user)
             return Device(
                 low_level,
@@ -221,7 +233,15 @@ class Device:
             self._protocol = self.descriptor.protocol if self.descriptor.protocol else None
             self.registers = self.descriptor.registers if self.descriptor.registers else []
 
-        if self._protocol is not None:
+        # For Centurion 0x50 direct devices (G522 etc.), the dongle does not relay HID++
+        # responses via interrupt IN — feature queries would time out.  Use an empty
+        # feature table so the device is shown without settings rather than hanging.
+        cent_state = base._centurion_handles.get(int(self.handle)) if (self.handle and self.centurion and not self.receiver) else None
+        _is_ble_bridge = cent_state is not None and cent_state.report_id == base.CENTURION_ADDRESSED_REPORT_ID
+        self._ble_bridge = _is_ble_bridge  # no HID++ relay on 0x50 — gates feature_request early return
+        if _is_ble_bridge:
+            self.features = {}
+        elif self._protocol is not None:
             self.features = {} if self._protocol < 2.0 else hidpp20.FeaturesArray(self)
         else:
             self.features = hidpp20.FeaturesArray(self)  # may be a 2.0 device; if not, it will fix itself later
@@ -263,7 +283,7 @@ class Device:
                     self._codename = codename
                 elif self.protocol < 2.0:
                     self._codename = "? (%s)" % (self.wpid or self.product_id)
-        return self._codename or f"?? ({self.wpid or self.product_id})"
+        return self._codename or getattr(self, "_centurion_usb_name", None) or f"?? ({self.wpid or self.product_id})"
 
     @property
     def name(self):
@@ -474,6 +494,20 @@ class Device:
         return self._settings
 
     def battery(self):  # None  or  level, next, status, voltage
+        if getattr(self, "_ble_bridge", False):
+            if not self.online:
+                return None
+            cent_state = base._centurion_handles.get(int(self.handle)) if self.handle else None
+            if cent_state is not None and cent_state.ble_battery is not None:
+                bat_pct, charge_raw = cent_state.ble_battery
+                if charge_raw == 0x01:
+                    status = BatteryStatus.RECHARGING
+                elif charge_raw == 0x02:
+                    status = BatteryStatus.ALMOST_FULL
+                else:
+                    status = BatteryStatus.DISCHARGING
+                return Battery(bat_pct, None, status, None)
+            return None
         if self.protocol < 2.0:
             return _hidpp10.get_battery(self)
         else:
@@ -635,6 +669,8 @@ class Device:
     def feature_request(self, feature, function=0x00, *params, no_reply=False):
         if self.protocol >= 2.0:
             if self.centurion:
+                if getattr(self, "_ble_bridge", False):
+                    return None  # Centurion 0x50 — dongle cannot relay HID++ responses
                 # Ensure sub-device features are discovered before routing decision
                 if self.features is not None:
                     self.features._check()
@@ -838,6 +874,27 @@ class Device:
     def ping(self):
         """Checks if the device is online and present, returns True of False.
         Some devices are integral with their receiver but may not be present even if the receiver responds to ping."""
+        # Centurion 0x50 (addressed) direct device — no bidirectional interrupt transport.
+        # Use the dongle's BLE debug log (GET_FEATURE report 0x07) to detect connection.
+        if self.centurion and not self.receiver:
+            cent_state = base._centurion_handles.get(int(self.handle)) if self.handle else None
+            if cent_state and cent_state.report_id == base.CENTURION_ADDRESSED_REPORT_ID:
+                connected, _device_addr = base.centurion_ble_connected(self.handle)
+                # Probe with battery query when state is unknown (startup with no
+                # notification yet) or when known-connected (to refresh battery cache).
+                if connected or cent_state.ble_connected is None:
+                    result = base.centurion_ble_battery(self.handle)
+                    if result is not None and cent_state.ble_connected is None:
+                        # Battery response confirms headset is on despite no prior notification.
+                        cent_state.ble_connected = True
+                    # Re-read: ble_connected may have been updated by battery query or
+                    # a connect notification that arrived during the 500ms read window.
+                    connected = cent_state.ble_connected is True
+                self.online = connected and self.present
+                if connected and not self._protocol:
+                    self._protocol = 2.0
+                return self.online
+
         if self.centurion and self.receiver and not self.handle:
             # Centurion child: first check if dongle is reachable
             handle = self.receiver.handle
