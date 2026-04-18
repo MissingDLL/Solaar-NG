@@ -27,6 +27,7 @@ import typing
 
 from contextlib import contextmanager
 from random import getrandbits
+from time import monotonic
 from time import time
 from typing import Any
 from typing import Callable
@@ -86,6 +87,9 @@ class HIDProtocol(typing.Protocol):
     def close(self, device_handle) -> None:
         ...
 
+    def read_feature_report(self, device_handle, report_id: int, size: int = 64) -> bytes | None:
+        ...
+
 
 SHORT_MESSAGE_SIZE = 7
 _LONG_MESSAGE_SIZE = 20
@@ -116,11 +120,26 @@ class CenturionHandleState:
     report_id: int = CENTURION_REPORT_ID  # 0x50 or 0x51
     device_addr: int | None = None  # learned from first RX (0x50 only)
     protocol_version: tuple[int, int] | None = None  # from ping response
+    ble_connected: bool | None = None  # cached BLE connection state for 0x50 devices
+    ble_battery: tuple[int, int] | None = None  # (percentage, charge_raw) for 0x50 devices
+    ble_muted: bool | None = None  # cached mic mute state (True = muted)
 
 
 # All centurion per-handle state in a single dict.
 # Membership test (ihandle in _centurion_handles) gates centurion-specific code paths.
 _centurion_handles: dict[int, CenturionHandleState] = {}
+
+# device_addr values learned during create_centurion_receiver() that didn't find a bridge.
+# Keyed by device path; consumed by create_device() so the address survives the handle re-open.
+_centurion_known_device_addrs: dict[str, int] = {}
+
+# Static fallback device_addr per USB product ID for CENTURION_ADDRESSED (0x50) devices.
+# Used when no addr has been learned yet (startup before first notification).
+# The address is learned dynamically from the first received frame and overrides this.
+_CENTURION_STATIC_DEVICE_ADDRS: dict[str, int] = {
+    "0B18": 0x23,  # G522 LIGHTSPEED Gaming Headset dongle
+    "0B19": 0x23,  # G522 wired variant
+}
 
 
 """Default timeout on read (in seconds)."""
@@ -322,6 +341,147 @@ def close(handle):
             pass
 
     return False
+
+
+def _centurion_intercept_notification(ihandle: int, notification: bytes) -> None:
+    """Update CenturionHandleState from incoming Centurion 0x50 interrupt-IN messages.
+
+    Called by _read() for every centurion long message after unwrapping.
+    ``notification`` is the payload after report_id and devnumber have been stripped,
+    i.e. data[2:] of the full 20-byte HID++ message.
+
+    Handled notification types (G522 / Centurion 0x50 addressed variant):
+
+    Connection status (direct from G522):
+      [0x05, 0x10, status, ...]   status: 0x01 = connected, 0x00 = disconnected
+      Raw frame example: 50 23 04 00 05 10 01 00  (connect)
+                         50 23 04 00 05 10 00 00  (disconnect)
+
+    Battery status (via dongle proxy):
+      [0x03, 0x10, unk, inner_len, inner_seq, inner_dev=0x05, inner_feat,
+       func_byte, bat_pct, charge_raw, ...]
+      inner_feat 0x0d = battery query response
+      inner_feat 0x00 = charging-event notification
+      inner_feat 0x0f = initial battery notification on connect
+      charge_raw: 0x00 = discharging, 0x01 = charging, 0x02 = charged/full
+    """
+    state = _centurion_handles.get(ihandle)
+    if state is None or len(notification) < 3:
+        return
+
+    sub_id = notification[0]
+    address = notification[1]
+
+    # Connection/disconnection: direct G522 notification
+    if sub_id == 0x05 and address == 0x10:
+        connected = (notification[2] == 0x01)
+        if state.ble_connected != connected:
+            logger.debug(
+                "centurion: BLE %s (interrupt notification)",
+                "connected" if connected else "disconnected",
+            )
+        state.ble_connected = connected
+        return
+
+    # Proxy notifications: sub_id=0x03, addr=0x10
+    if sub_id == 0x03 and address == 0x10 and len(notification) >= 8:
+        inner_dev = notification[5]
+        inner_feat = notification[6]
+
+        # Battery (inner_dev=0x05): query response, charge events, initial-on-connect
+        if inner_dev == 0x05 and len(notification) >= 10:
+            bat_pct = notification[8]
+            charge_raw = notification[9]
+            state.ble_battery = (bat_pct, charge_raw)
+            logger.debug("centurion: battery %d%%, charge_raw=0x%02x (feat=0x%02x)", bat_pct, charge_raw, inner_feat)
+
+        # Mute state (inner_dev=0x15, inner_feat=0x00)
+        elif inner_dev == 0x15 and inner_feat == 0x00:
+            muted = (notification[7] == 0x01)
+            state.ble_muted = muted
+            logger.debug("centurion: mic %s", "muted" if muted else "unmuted")
+
+
+def centurion_ble_connected(handle) -> tuple[bool, int | None]:
+    """Return cached BLE connection status for a Centurion 0x50 (addressed) device.
+
+    Connection state is updated automatically by _centurion_intercept_notification()
+    whenever a connect/disconnect notification arrives on the interrupt IN endpoint.
+    This replaces the previous log-draining approach (report 0x07).
+
+    :param handle: open HID device handle.
+    :returns: (is_connected, device_addr).
+    """
+    ihandle = int(handle)
+    state = _centurion_handles.get(ihandle)
+    if state is None:
+        return False, None
+
+    if state.ble_connected is not None:
+        return state.ble_connected, state.device_addr
+
+    # No notification seen yet — connection state unknown.  ping() will probe via
+    # battery query; until confirmed, treat as offline so the device is not shown
+    # as active before we know its real state.
+    return False, state.device_addr
+
+
+def centurion_ble_battery(handle) -> tuple[int, int] | None:
+    """Query battery status from a G522 via the Centurion 0x50 proxy protocol.
+
+    Sends a battery query to inner dev=0x05, feat=0x0d and waits up to 500 ms
+    for the response.  Must be called from the listener thread (the same thread
+    that drives base.read()) to avoid concurrent HID read conflicts.
+
+    Battery query frame:  50 23 08 00 03 1d 00 03 00 05 0d [zeros...]
+    Battery response:     50 23 0b 00 03 10 00 06 00 05 0d [func] [bat%] [charge]
+
+    :param handle: open HID device handle.
+    :returns: (battery_percent, charge_raw) or None on timeout/error.
+              charge_raw: 0x00 = discharging, 0x01 = charging, 0x02 = charged/full.
+              Also updates CenturionHandleState.ble_battery on success.
+    """
+    ihandle = int(handle)
+    state = _centurion_handles.get(ihandle)
+    if state is None:
+        return None
+
+    # Outer: dev=0x03 (dongle), feat=0x1d (outgoing relay)
+    # Inner: dev=0x05 (G522), feat=0x0d (battery feature), no args
+    query = bytes([0x03, 0x1d, 0x00, 0x03, 0x00, 0x05, 0x0d])
+    write(ihandle, 0xFF, query)
+
+    deadline = monotonic() + 0.5
+    while monotonic() < deadline:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        result = _read(handle, min(remaining, 0.15))
+        if not result:
+            continue
+        report_id, _devnumber, data = result
+        if len(data) < 10:
+            continue
+        # Battery response: sub_id=0x03, addr=0x10, inner_dev=0x05, inner_feat=0x0d
+        if (
+            report_id == HIDPP_LONG_MESSAGE_ID
+            and data[0] == 0x03
+            and data[1] == 0x10
+            and data[5] == 0x05
+            and data[6] == 0x0d
+        ):
+            bat_pct = data[8]
+            charge_raw = data[9]
+            state.ble_battery = (bat_pct, charge_raw)
+            logger.debug("centurion: battery %d%%, charge_raw=0x%02x (query)", bat_pct, charge_raw)
+            return bat_pct, charge_raw
+        # Handle connection notifications that arrive before the battery response
+        if data[0] == 0x05 and data[1] == 0x10 and len(data) >= 3:
+            connected = (data[2] == 0x01)
+            state.ble_connected = connected
+
+    # Query timed out — return cached value if available
+    return state.ble_battery
 
 
 def _centurion_frame_header(state: CenturionHandleState, cpl_length: int, flags: int) -> bytes:
@@ -594,6 +754,10 @@ def _read(handle, timeout) -> tuple[int, int, bytes]:
                 common.strhex(data[2:4]),
                 common.strhex(data[4:]),
             )
+
+        # Intercept Centurion 0x50 connection and battery notifications to update cached state.
+        if is_centurion and report_id == HIDPP_LONG_MESSAGE_ID:
+            _centurion_intercept_notification(ihandle, data[2:])
 
         return report_id, devnumber, data[2:]
 

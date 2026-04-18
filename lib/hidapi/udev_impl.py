@@ -349,6 +349,34 @@ def close(device_handle) -> None:
     os.close(device_handle)
 
 
+def read_feature_report(device_handle, report_id, size=64):
+    """Read a Feature report from a HID device via GET_REPORT ioctl.
+
+    :param device_handle: a device handle returned by open() or open_path().
+    :param report_id: the HID report ID to request.
+    :param size: total buffer size including the report ID byte.
+
+    :returns: the raw report bytes (including report ID as byte 0), or None on error.
+    """
+    import ctypes
+    import fcntl
+
+    # HIDIOCGFEATURE(size) ioctl
+    _IOC_DIRSHIFT = 30
+    _IOC_TYPESHIFT = 8
+    _IOC_NRSHIFT = 0
+    _IOC_SIZESHIFT = 16
+    HIDIOCGFEATURE = ((3 << _IOC_DIRSHIFT) | (ord("H") << _IOC_TYPESHIFT) | (0x07 << _IOC_NRSHIFT) | (size << _IOC_SIZESHIFT))
+
+    buf = bytearray(size)
+    buf[0] = report_id
+    try:
+        fcntl.ioctl(device_handle, HIDIOCGFEATURE, buf)
+        return bytes(buf)
+    except OSError:
+        return None
+
+
 def write(device_handle, data):
     """Write an Output report to a HID device.
 

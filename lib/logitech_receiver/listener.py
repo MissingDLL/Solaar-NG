@@ -19,6 +19,7 @@ import dataclasses
 import logging
 import queue
 import threading
+import time
 
 from . import base
 from . import exceptions
@@ -111,6 +112,8 @@ class _ThreadedHandle:
 # is signalled to stop, it would take a while for it to acknowledge it.
 # Forcibly closing the file handle on another thread does _not_ interrupt the read on Linux systems.
 _EVENT_READ_TIMEOUT = 1.0  # in seconds
+_BLE_POLL_INTERVAL = 3.0  # seconds between BLE bridge status polls (while online)
+_BLE_OFFLINE_POLL_INTERVAL = 0.5  # faster poll while offline to catch reconnect quickly
 
 
 class EventsListener(threading.Thread):
@@ -142,6 +145,9 @@ class EventsListener(threading.Thread):
             if self.receiver.ping():
                 self.receiver.changed(active=True, reason="initialization")
 
+        _ble_bridge = getattr(self.receiver, "_ble_bridge", False)
+        _ble_last_poll = time.monotonic()
+
         while self._active:
             if self._queued_notifications.empty():
                 try:
@@ -153,6 +159,40 @@ class EventsListener(threading.Thread):
                 if n:
                     report_id, devnumber, data = n
                     n = base.make_notification(report_id, devnumber, data)
+
+                # Periodic BLE status poll for Centurion 0x50 direct devices.
+                # The debug-log drain is cheap when empty (single ioctl returning 0 bytes).
+                if _ble_bridge:
+                    now = time.monotonic()
+                    _cent_state = base._centurion_handles.get(int(self.receiver.handle)) if self.receiver.handle else None
+                    _ble_known = _cent_state is not None and _cent_state.ble_connected is not None
+                    _poll_interval = _BLE_POLL_INTERVAL if (self.receiver.online and _ble_known) else _BLE_OFFLINE_POLL_INTERVAL
+                    if now - _ble_last_poll >= _poll_interval:
+                        _ble_last_poll = now
+                        was_online = self.receiver.online
+                        was_active = self.receiver._active
+                        try:
+                            self.receiver.ping()
+                        except Exception:
+                            logger.exception("BLE poll ping failed for %s", self.receiver)
+                            continue
+                        # Trigger changed() if online state changed OR if online but not yet _active.
+                        # The latter handles the case where a connect notification pre-set device.online=True
+                        # via process_device_notification before the poll detected the reconnect.
+                        if self.receiver.online != was_online or (self.receiver.online and not was_active):
+                            reason = "BLE headset " + ("connected" if self.receiver.online else "disconnected")
+                            logger.info("%s: %s", self.receiver, reason)
+                            try:
+                                self.receiver.changed(active=self.receiver.online, reason=reason)
+                            except Exception:
+                                logger.exception("BLE poll changed() failed for %s", self.receiver)
+                        elif self.receiver.online:
+                            # No state change — refresh battery info in case ping() updated the cache.
+                            try:
+                                self.receiver.read_battery()
+                            except Exception:
+                                pass
+
             else:
                 n = self._queued_notifications.get()  # deliver any queued notifications
             if n:

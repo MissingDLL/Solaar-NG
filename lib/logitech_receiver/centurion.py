@@ -574,6 +574,10 @@ def create_centurion_receiver(low_level, device_info, setting_callback=None):
                 return cr
 
             logger.info("Centurion device %s has no bridge, treating as direct device", device_info.path)
+            # Save any device_addr learned during feature discovery so create_device()
+            # can reuse it on the new handle instead of sending queries with addr=0x00.
+            if state and state.device_addr is not None:
+                base._centurion_known_device_addrs[device_info.path] = state.device_addr
             base._centurion_handles.pop(int(handle), None)
             cr.handle = None  # prevent __del__ from double-closing
             low_level.close(handle)
