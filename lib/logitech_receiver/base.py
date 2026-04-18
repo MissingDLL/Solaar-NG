@@ -141,6 +141,12 @@ _CENTURION_STATIC_DEVICE_ADDRS: dict[str, int] = {
     "0B19": 0x23,  # G522 wired variant
 }
 
+# Centurion 0x50 devices that are wired (USB cable) — always online when handle is open.
+# No BLE battery probe needed; online state = cable physically connected.
+_CENTURION_WIRED_PIDS: frozenset[str] = frozenset({
+    "0B19",  # G522 LIGHTSPEED Gaming Headset (USB / charging mode)
+})
+
 
 """Default timeout on read (in seconds)."""
 DEFAULT_TIMEOUT = 4

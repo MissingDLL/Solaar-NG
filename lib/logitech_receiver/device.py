@@ -236,10 +236,13 @@ class Device:
         # For Centurion 0x50 direct devices (G522 etc.), the dongle does not relay HID++
         # responses via interrupt IN — feature queries would time out.  Use an empty
         # feature table so the device is shown without settings rather than hanging.
+        # Exception: wired (USB cable) centurion devices ARE directly accessible via HID++.
         cent_state = base._centurion_handles.get(int(self.handle)) if (self.handle and self.centurion and not self.receiver) else None
         _is_ble_bridge = cent_state is not None and cent_state.report_id == base.CENTURION_ADDRESSED_REPORT_ID
         self._ble_bridge = _is_ble_bridge  # no HID++ relay on 0x50 — gates feature_request early return
-        if _is_ble_bridge:
+        _pid = getattr(device_info, "product_id", None) if device_info else None
+        self._wired_centurion = _is_ble_bridge and _pid in base._CENTURION_WIRED_PIDS
+        if _is_ble_bridge and not self._wired_centurion:
             self.features = {}
         elif self._protocol is not None:
             self.features = {} if self._protocol < 2.0 else hidpp20.FeaturesArray(self)
@@ -669,8 +672,8 @@ class Device:
     def feature_request(self, feature, function=0x00, *params, no_reply=False):
         if self.protocol >= 2.0:
             if self.centurion:
-                if getattr(self, "_ble_bridge", False):
-                    return None  # Centurion 0x50 — dongle cannot relay HID++ responses
+                if getattr(self, "_ble_bridge", False) and not getattr(self, "_wired_centurion", False):
+                    return None  # Centurion 0x50 wireless — dongle cannot relay HID++ responses
                 # Ensure sub-device features are discovered before routing decision
                 if self.features is not None:
                     self.features._check()
@@ -879,6 +882,30 @@ class Device:
         if self.centurion and not self.receiver:
             cent_state = base._centurion_handles.get(int(self.handle)) if self.handle else None
             if cent_state and cent_state.report_id == base.CENTURION_ADDRESSED_REPORT_ID:
+                # Wired (USB cable) devices are always online while the handle is open.
+                # Query battery directly via HID++ feature (not BLE proxy protocol).
+                if getattr(self, "_wired_centurion", False):
+                    self.online = self.present
+                    if not self._protocol:
+                        self._protocol = 2.0
+                    if self.online:
+                        from .centurion import get_battery_centurion
+                        result = get_battery_centurion(self)
+                        if result and cent_state:
+                            try:
+                                _, bat = result
+                                if bat.level is not None:
+                                    if bat.status == BatteryStatus.RECHARGING:
+                                        charge_raw = 0x01
+                                    elif bat.status in (BatteryStatus.FULL, BatteryStatus.ALMOST_FULL):
+                                        charge_raw = 0x02
+                                    else:
+                                        charge_raw = 0x00
+                                    cent_state.ble_battery = (bat.level, charge_raw)
+                            except (TypeError, AttributeError):
+                                pass
+                    return self.online
+
                 connected, _device_addr = base.centurion_ble_connected(self.handle)
                 # Probe with battery query when state is unknown (startup with no
                 # notification yet) or when known-connected (to refresh battery cache).
