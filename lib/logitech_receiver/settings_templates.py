@@ -3224,6 +3224,8 @@ def check_feature_settings(device, already_known) -> bool:
         return False
     if device.protocol and device.protocol < 2.0:
         return False
+    if getattr(device, "_wired_centurion", False):
+        return False  # wired USB mode: only battery is shown, no configurable settings
     absent = device.persister.get("_absent", []) if device.persister else []
     new_absent = []
     for sclass in SETTINGS:
